@@ -169,6 +169,22 @@ enum ImageCropHandle: CaseIterable {
 }
 
 enum ImageCropFrame {
+    /// Display-to-pixel transforms can leave integer edges a few ulps away.
+    /// Preserve real fractional selections without adding a spurious pixel.
+    static func pixelAligned(_ rect: CGRect) -> CGRect {
+        snappingEdges(rect).integral
+    }
+    static func snappingEdges(_ rect: CGRect) -> CGRect {
+        guard !rect.isNull, !rect.isInfinite else { return rect }
+        func snapped(_ value: CGFloat) -> CGFloat {
+            let integer = value.rounded()
+            return abs(value - integer) < 0.000001 ? integer : value
+        }
+        let rect = rect.standardized
+        let minX = snapped(rect.minX), minY = snapped(rect.minY)
+        return CGRect(x: minX, y: minY, width: snapped(rect.maxX) - minX,
+                      height: snapped(rect.maxY) - minY)
+    }
     static func moved(_ rect: CGRect, by delta: CGPoint, in size: CGSize) -> CGRect {
         CGRect(x: min(max(0, (rect.minX + delta.x).rounded()), max(0, size.width - rect.width)),
                y: min(max(0, (rect.minY + delta.y).rounded()), max(0, size.height - rect.height)),
@@ -277,7 +293,7 @@ final class ImageEditDocument: ObservableObject {
     @Published private(set) var cropPreset: ImageCropPreset?
     var visibleCropSelection: CGRect? { cropSelection?.applying(state.geometry.transform) }
     func setVisibleCropSelection(_ rect: CGRect) {
-        cropSelection = rect.applying(state.geometry.transform.inverted())
+        cropSelection = ImageCropFrame.snappingEdges(rect.applying(state.geometry.transform.inverted()))
     }
     func cancelCrop() { cropSelection = nil; cropPreset = nil }
     @Published var message = ""
@@ -325,7 +341,7 @@ final class ImageEditDocument: ObservableObject {
               annotation.tool != .text || !annotation.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if annotation.tool == .mosaic {
             guard let first = annotation.points.first, let last = annotation.points.last else { return }
-            let rect = ImageAnnotation.rectangle(first, last).integral.intersection(state.crop)
+            let rect = ImageCropFrame.pixelAligned(ImageAnnotation.rectangle(first, last)).intersection(state.crop)
             guard !rect.isNull, rect.width >= 2, rect.height >= 2,
                   let snapshot = try? renderedImage(oriented: false),
                   let region = snapshot.cropping(to: rect.offsetBy(dx: -state.crop.minX, dy: -state.crop.minY)),
@@ -344,7 +360,7 @@ final class ImageEditDocument: ObservableObject {
     }
     func applyCrop() {
         guard let selection = cropSelection else { return }
-        let rect = selection.standardized.intersection(state.crop).integral.intersection(state.crop)
+        let rect = ImageCropFrame.pixelAligned(selection.standardized.intersection(state.crop)).intersection(state.crop)
         guard !rect.isNull, rect.width >= 2, rect.height >= 2 else { return }
         var next = state
         next.crop = rect

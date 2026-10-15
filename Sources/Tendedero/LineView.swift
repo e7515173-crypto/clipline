@@ -23,6 +23,17 @@ struct LineView: View {
     @ObservedObject var line: Line
     @ObservedObject var clipboard: ClipboardHistory
     @ObservedObject var pinnedPhotos: PinnedPhotos
+    @ObservedObject var folders: FolderShelf
+    @Namespace private var sectionSelection
+    @State private var sectionTabsWidth: CGFloat = 0
+    @State private var clipboardToolsWidth: CGFloat = 112
+
+    init(line: Line, clipboard: ClipboardHistory, pinnedPhotos: PinnedPhotos) {
+        self.line = line
+        self.clipboard = clipboard
+        self.pinnedPhotos = pinnedPhotos
+        self.folders = line.folders
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -36,6 +47,10 @@ struct LineView: View {
                             .transition(.asymmetric(insertion: .move(edge: .trailing),
                                                     removal: .move(edge: .trailing))
                                 .animation(.spring(response: 0.48, dampingFraction: 0.9)))
+                    } else if case .folder = line.section {
+                        FolderView(folders: folders, line: line)
+                            .id(folders.selectedID)
+                            .transition(.opacity)
                     } else {
                         ZStack(alignment: .topLeading) {
                             ScreenshotRow(line: line, hasPinnedPhotos: !pinnedPhotos.photos.isEmpty)
@@ -51,7 +66,7 @@ struct LineView: View {
                 .clipped()
 
                 if line.showsControls {
-                    controls
+                    controls(width: width)
                         .position(x: width / 2, y: 189)
                         .transition(.opacity)
                 }
@@ -75,62 +90,164 @@ struct LineView: View {
         }
     }
 
-    private var controls: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 2) {
-                sectionButton(.screenshots, title: C("Captures", "截图与录屏", "截圖與錄影"), count: line.liveCount, icon: "photo")
-                sectionButton(.clipboard, title: C("Clipboard", "剪贴板"), count: clipboard.entries.count, icon: "doc.on.clipboard")
+    private func controls(width: CGFloat) -> some View {
+        let toolsWidth = line.section == .clipboard ? clipboardToolsWidth + 12 : 0
+        let availableTabsWidth = max(80, width - 32 - 52 - toolsWidth)
+        let tabsWidth = min(max(80, sectionTabsWidth), availableTabsWidth)
+        return HStack(spacing: 12) {
+            HStack(spacing: 3) {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal) {
+                        sectionTabs
+                            .fixedSize(horizontal: true, vertical: false)
+                            .background(GeometryReader { g in
+                                Color.clear.preference(key: SectionTabsWidthKey.self, value: g.size.width)
+                            })
+                    }
+                    .scrollIndicators(.hidden)
+                    .onAppear { proxy.scrollTo(line.section, anchor: .center) }
+                    .onChange(of: line.section) { _, section in proxy.scrollTo(section, anchor: .center) }
+                    .onChange(of: tabsWidth) { _, _ in proxy.scrollTo(line.section, anchor: .center) }
+                }
+                .frame(width: tabsWidth, height: 29)
+                .onPreferenceChange(SectionTabsWidthKey.self) { value in
+                    if value > 0, abs(sectionTabsWidth - value) > 0.5 { sectionTabsWidth = value }
+                }
+                Button { line.onRequestAddFolder?() } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 27, height: 29)
+                        .contentShape(Circle())
+                }
+                .help(C("Add folder", "添加文件夹", "新增資料夾"))
+                .accessibilityLabel(C("Add folder", "添加文件夹", "新增資料夾"))
             }
-            .padding(3)
-            .glassFrame(capsule: true)
 
             if line.section == .clipboard {
-                Label(clipboard.isTracking ? C("Recording", "正在记录") : C("Paused", "已暂停"),
-                      systemImage: clipboard.isTracking ? "circle.fill" : "pause.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(clipboard.isTracking ? Color.secondary : Color.orange)
-                    .help(C("Clipboard history is cleared on quit", "剪贴板历史退出后清空"))
-                Button { clipboard.setTracking(!clipboard.isTracking) } label: {
-                    Image(systemName: clipboard.isTracking ? "pause.circle" : "play.circle")
-                        .font(.system(size: 15))
-                        .frame(width: 26, height: 26)
-                }
-                .help(clipboard.isTracking ? C("Pause recording", "暂停记录") : C("Resume recording", "继续记录"))
-                .accessibilityLabel(clipboard.isTracking ? C("Pause recording", "暂停记录") : C("Resume recording", "继续记录"))
-                Button { clipboard.clear() } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 13))
-                        .frame(width: 26, height: 26)
-                }
-                .disabled(clipboard.entries.isEmpty)
-                .help(C("Clear clipboard history", "清空剪贴板历史"))
-                .accessibilityLabel(C("Clear clipboard history", "清空剪贴板历史"))
+                clipboardTools
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(GeometryReader { g in
+                        Color.clear.preference(key: ClipboardToolsWidthKey.self, value: g.size.width)
+                    })
+                    .onPreferenceChange(ClipboardToolsWidthKey.self) { value in
+                        if value > 0, abs(clipboardToolsWidth - value) > 0.5 { clipboardToolsWidth = value }
+                    }
             }
         }
         .buttonStyle(.plain)
+        .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .glassFrame(capsule: true)
+        .padding(.vertical, 4)
+        .modifier(LineControlsGlass())
         .background(GeometryReader { g in
             Color.clear.preference(key: LineControlsKey.self, value: g.frame(in: .named("line")))
         })
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: line.section)
     }
 
-    private func sectionButton(_ section: Line.Section, title: String, count: Int, icon: String) -> some View {
+    private var clipboardTools: some View {
+        HStack(spacing: 10) {
+            Label(clipboard.isTracking ? C("Recording", "正在记录") : C("Paused", "已暂停"),
+                  systemImage: clipboard.isTracking ? "circle.fill" : "pause.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(clipboard.isTracking ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+                .help(C("Clipboard history is cleared on quit", "剪贴板历史退出后清空"))
+            Button { clipboard.setTracking(!clipboard.isTracking) } label: {
+                Image(systemName: clipboard.isTracking ? "pause.circle" : "play.circle")
+                    .font(.system(size: 15))
+                    .frame(width: 26, height: 29)
+            }
+            .help(clipboard.isTracking ? C("Pause recording", "暂停记录") : C("Resume recording", "继续记录"))
+            .accessibilityLabel(clipboard.isTracking ? C("Pause recording", "暂停记录") : C("Resume recording", "继续记录"))
+            Button { clipboard.clear() } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 13))
+                    .frame(width: 26, height: 29)
+            }
+            .disabled(clipboard.entries.isEmpty)
+            .help(C("Clear clipboard history", "清空剪贴板历史"))
+            .accessibilityLabel(C("Clear clipboard history", "清空剪贴板历史"))
+        }
+    }
+
+    private var sectionTabs: some View {
+        HStack(spacing: 2) {
+            sectionButton(.screenshots, title: C("Captures", "截图与录屏", "截圖與錄影"), count: line.liveCount, icon: "photo")
+            sectionButton(.clipboard, title: C("Clipboard", "剪贴板"), count: clipboard.entries.count, icon: "doc.on.clipboard")
+            ForEach(folders.mounts) { mount in
+                sectionButton(.folder(mount.id), title: mount.name, count: nil, icon: "folder")
+                    .help(mount.url.path)
+                    .contextMenu {
+                        Button(C("Open folder in Finder", "在访达中打开文件夹", "在 Finder 中開啟資料夾")) {
+                            NSWorkspace.shared.open(mount.url)
+                        }
+                        Button(C("Remove folder from line", "从晾绳移除文件夹", "從曬衣繩移除資料夾")) {
+                            if line.section == .folder(mount.id) { line.section = .screenshots }
+                            folders.remove(mount.id)
+                        }
+                    }
+            }
+        }
+    }
+
+    private func sectionButton(_ section: Line.Section, title: String, count: Int?, icon: String) -> some View {
         Button { line.section = section } label: {
             HStack(spacing: 5) {
                 Image(systemName: icon)
-                Text(title)
-                Text("\(count)").monospacedDigit().foregroundStyle(.secondary)
+                Text(title).lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: 110)
+                if let count { Text("\(count)").monospacedDigit().foregroundStyle(.secondary) }
             }
             .font(.system(size: 11, weight: .medium))
             .padding(.horizontal, 12)
-            .frame(height: 25)
-            .background(line.section == section ? Color.primary.opacity(0.12) : .clear, in: Capsule())
+            .frame(height: 29)
+            .background {
+                if line.section == section {
+                    Color.clear
+                        .modifier(LineControlsGlass(interactive: true))
+                        .matchedGeometryEffect(id: "selected-section", in: sectionSelection)
+                }
+            }
             .contentShape(Capsule())
         }
         .accessibilityAddTraits(line.section == section ? .isSelected : [])
+        .id(section)
     }
+}
+
+/// Native Liquid Glass is scoped to the section controls; cards keep their style.
+private struct LineControlsGlass: ViewModifier {
+    var interactive = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+    @ViewBuilder func body(content: Content) -> some View {
+        if interactive {
+            // Selection is a thin overlay on the glass, never another glass layer.
+            content.background(.primary.opacity(0.12), in: Capsule())
+                .overlay(Capsule().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
+        } else if #available(macOS 26.0, *) {
+            if reduceTransparency || contrast == .increased {
+                content.glassEffect(.regular, in: Capsule())
+            } else {
+                // Apple's clear variant needs dimming behind symbols and labels.
+                content.foregroundStyle(.white)
+                    .background(Color.black.opacity(0.35), in: Capsule())
+                    .glassEffect(.clear, in: Capsule())
+            }
+        } else {
+            content.glassFrame(capsule: true)
+        }
+    }
+}
+
+private struct SectionTabsWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+private struct ClipboardToolsWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 private struct LineControlsKey: PreferenceKey {

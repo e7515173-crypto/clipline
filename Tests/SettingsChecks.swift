@@ -28,8 +28,9 @@ struct SettingsChecks {
         let originalEntries = clipboard.entries.map(\.id)
         let originalScreenshots = line.items.map(\.id)
         var permissionGranted = false
+        var permissionChecks = 0
         var listening = false
-        let preferences = SettingsPreferences(line: line, permissionCheck: { permissionGranted },
+        let preferences = SettingsPreferences(line: line, permissionCheck: { permissionChecks += 1; return permissionGranted },
                                                listeningCheck: { listening })
         var mutationCallbacks = 0
         let host = NSHostingView(rootView: SettingsView(line: line, clipboard: clipboard,
@@ -58,44 +59,57 @@ struct SettingsChecks {
         let output = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("build")
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         let variants: [(AppLanguageChoice, [String])] = [
-            (.en, ["Settings", "Language", "Screenshot and recording folder", "Double-click empty menu-bar space", "Handle screenshots", "Sounds", "Long-press an image", "This copy of Clipline needs Accessibility permission", "Open at login", "Clear clipboard history", "Take everything down"]),
-            (.zhHans, ["设置", "语言", "截图与录屏保存位置", "双击菜单栏空白处", "接管系统截图", "音效", "长按图片", "当前运行的 Clipline 尚未获得辅助功能权限", "登录时启动", "清空剪贴板历史", "移除全部截图"]),
-            (.zhHant, ["設定", "語言", "截圖與錄影儲存位置", "按兩下選單列空白處", "接管系統截圖", "音效", "長按圖片", "目前執行的 Clipline 尚未取得輔助使用權限", "登入時啟動", "清空剪貼簿記錄", "移除所有截圖"])
+            (.en, ["Settings", "Language", "5 seconds", "Screenshot and recording folder", "Double-click empty menu-bar space", "Handle screenshots", "Sounds", "Long-press an image", "This copy of Clipline needs Accessibility permission", "Open at login", "Clear clipboard history", "Take everything down"]),
+            (.zhHans, ["设置", "语言", "5 秒", "截图与录屏保存位置", "双击菜单栏空白处", "接管系统截图", "音效", "长按图片", "Clipline 尚未获得辅助功能权限", "登录时启动", "清空剪贴板历史", "移除全部截图"]),
+            (.zhHant, ["設定", "語言", "5 秒", "截圖與錄影儲存位置", "按兩下選單列空白處", "接管系統截圖", "音效", "長按圖片", "Clipline 尚未取得輔助使用權限", "登入時啟動", "清空剪貼簿記錄", "移除所有截圖"])
         ]
-        for (choice, expectedLabels) in variants {
-            language.selected = choice
-            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+        func findScrollView(_ view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView { return scroll }
+            for child in view.subviews { if let scroll = findScrollView(child) { return scroll } }
+            return nil
+        }
+        func renderedPage(_ name: String, bottom: Bool, choice: AppLanguageChoice) throws -> [String] {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.15))
             host.layoutSubtreeIfNeeded()
-            guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { fatalError("Cannot render settings") }
+            guard let scroll = findScrollView(host), let document = scroll.documentView else {
+                fatalError("Settings must expose a native scroll view")
+            }
+            let maximumY = max(0, document.bounds.height - scroll.contentView.bounds.height)
+            let y = (bottom == document.isFlipped) ? maximumY : 0
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            host.layoutSubtreeIfNeeded()
+            let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds)!
             host.cacheDisplay(in: host.bounds, to: bitmap)
-            guard let png = bitmap.representation(using: .png, properties: [:]), let cgImage = bitmap.cgImage else { fatalError("Cannot encode settings") }
-            try png.write(to: output.appendingPathComponent("settings-preview-\(choice.rawValue).png"))
+            try bitmap.representation(using: .png, properties: [:])!.write(to: output.appendingPathComponent(name + ".png"))
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = false
-            request.recognitionLanguages = [choice == .zhHant ? "zh-Hant" : "zh-Hans", "en-US"]
-            try VNImageRequestHandler(cgImage: cgImage).perform([request])
-            let labels = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            request.usesLanguageCorrection = true
+            request.recognitionLanguages = choice == .en ? ["en-US"] : [choice == .zhHant ? "zh-Hant" : "zh-Hans", "en-US"]
+            try VNImageRequestHandler(cgImage: bitmap.cgImage!).perform([request])
+            // OCR checks visible, reachable controls; exact translations have
+            // separate dictionary checks because Vision may omit Chinese particles.
+            return (request.results ?? []).flatMap { $0.topCandidates(5).map(\.string) }
+        }
+        func normalized(_ value: String) -> String {
+            value.lowercased().filter { !$0.isWhitespace }
+        }
+        for (choice, expectedLabels) in variants {
+            language.selected = choice
+            let top = try renderedPage("settings-preview-\(choice.rawValue)", bottom: false, choice: choice)
+            let bottom = try renderedPage("settings-preview-\(choice.rawValue)-bottom", bottom: true, choice: choice)
+            let labels = top + bottom
             for label in expectedLabels {
-                check(labels.contains { $0.replacingOccurrences(of: " ", with: "").contains(label.replacingOccurrences(of: " ", with: "")) },
-                      "\(choice.rawValue) rendered text is visible without truncation: \(label); actual: \(labels)")
+                check(labels.contains { normalized($0).contains(normalized(label)) },
+                      "\(choice.rawValue) rendered text is reachable without truncation: \(label); actual: \(labels)")
             }
             check(host.bounds.size == CGSize(width: 540, height: 720), "settings dimensions remain stable")
             check(clipboard.entries.map(\.id) == originalEntries && line.items.map(\.id) == originalScreenshots,
                   "language switches preserve clipboard and screenshot history")
         }
         func renderedStatus(_ suffix: String) throws -> String {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
-            host.layoutSubtreeIfNeeded()
-            let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds)!
-            host.cacheDisplay(in: host.bounds, to: bitmap)
-            try bitmap.representation(using: .png, properties: [:])!.write(to: output.appendingPathComponent("settings-permission-\(suffix).png"))
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = false
-            request.recognitionLanguages = ["en-US"]
-            try VNImageRequestHandler(cgImage: bitmap.cgImage!).perform([request])
-            return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+            try renderedPage("settings-permission-" + suffix, bottom: false, choice: .en).joined(separator: " ")
         }
         preferences.refreshAccessibility()
         check(!preferences.accessibilityGranted && !preferences.menuBarListening, "untrusted running process is reported accurately")
@@ -119,6 +133,14 @@ struct SettingsChecks {
         check(!preferences.accessibilityGranted && !preferences.menuBarListening, "revocation clears permission and listening status")
         check(mutationCallbacks == 0, "rendering and switching languages do not change system screenshot or login settings")
         check(defaults.stringArray(forKey: "AppleLanguages") == originalSystemLanguages, "system language preferences remain untouched")
+        let beforeMonitoring = permissionChecks
+        preferences.startMonitoring()
+        RunLoop.main.run(until: Date().addingTimeInterval(1.1))
+        check(permissionChecks > beforeMonitoring, "visible settings refresh permission state")
+        preferences.stopMonitoring()
+        let afterMonitoring = permissionChecks
+        RunLoop.main.run(until: Date().addingTimeInterval(1.1))
+        check(permissionChecks == afterMonitoring, "closed settings stop background permission polling")
         print("PASS: \(checks) offscreen settings layout, rendered-text and live-language checks")
     }
 }

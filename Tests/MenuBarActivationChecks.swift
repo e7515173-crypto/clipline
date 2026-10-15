@@ -138,6 +138,19 @@ actor DelayedHit {
         await delayed.release()
         await settle()
         check(cancelledActions == 0, "window/menu/drag cancellation prevents a delayed validation from reopening the line")
+        let enabledHits = ScriptedHits([.blank, .blank])
+        let enabled = model(enabledHits)
+        var enabledActions = 0
+        enabled.onActivate = { _ in enabledActions += 1 }
+        click(enabled, 20)
+        enabled.isEnabled = false
+        click(enabled, 20.2); click(enabled, 20.4)
+        await settle()
+        check(enabledActions == 0, "disabled setting rejects clicks and cancels the pending first click")
+        enabled.isEnabled = true
+        click(enabled, 21); click(enabled, 21.2)
+        await settle()
+        check(enabledActions == 1, "enabling the setting restores activation immediately")
         print("PASS: \(checks) asynchronous double-click activation checks (invented hits only)")
     }
 }

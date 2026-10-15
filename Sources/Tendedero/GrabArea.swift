@@ -49,6 +49,9 @@ struct GrabArea: NSViewRepresentable {
             // Moved into a folder: it is saved where you wanted it.
             line.prune()
         }
+        view.onSuccessfulDrop = {
+            if line.retractAfterDrag { line.onRequestRetract?() }
+        }
         view.onTrash = { line.trash(id) }
         view.onDiscard = { line.discard(id) }
         view.onLongPress = { line.open(id) }
@@ -103,10 +106,12 @@ final class GrabView: NSView, NSDraggingSource {
     var onClick: () -> Void = {}
     var onDoubleClick: () -> Void = {}
     var doubleClickShowsMenu = false
+    var showsDiscardControl = true
     var onMenuWillOpen: () -> Void = {}
     var onMenuDidClose: () -> Void = {}
     var onDragStart: () -> Void = {}
     var onDragEnd: () -> Void = {}
+    var onSuccessfulDrop: () -> Void = {}
     var onTrash: () -> Void = {}
     var onDiscard: () -> Void = {}
     var onLongPress: () -> Void = {}
@@ -148,7 +153,7 @@ final class GrabView: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if isInCross(event) {
+        if showsDiscardControl && isInCross(event) {
             downPoint = nil
             onDiscard()
             return
@@ -235,6 +240,11 @@ final class GrabView: NSView, NSDraggingSource {
         startedDrag = false
         downPoint = nil
         log.notice("Drag ended with operation \(operation.rawValue, privacy: .public)")
+        // A cancelled or rejected drop keeps the line available for another try.
+        // Notify once, after cleanup; the delayed move check is not a second drop.
+        defer {
+            if !operation.isEmpty { onSuccessfulDrop() }
+        }
         // Dropped on the Trash: macOS only tells us, we move the file.
         if operation.contains(.delete) {
             onDragEnd()

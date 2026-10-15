@@ -25,9 +25,12 @@ struct Pegged: Identifiable, Equatable {
 /// Browsing and taking down preserve files; explicit deletion uses the Trash.
 @MainActor
 final class Line: ObservableObject {
-    enum Section { case screenshots, clipboard }
+    enum Section: Hashable { case screenshots, clipboard, folder(UUID) }
+    let folders: FolderShelf
     @Published var section: Section = .screenshots {
         didSet {
+            if case .folder(let id) = section { folders.select(id) }
+            else if folders.selectedID != nil { folders.select(nil) }
             if section != .screenshots {
                 videoPreview.stop()
                 screenshotScrollView = nil
@@ -65,6 +68,26 @@ final class Line: ObservableObject {
             if !showsControls { controlsRect = .zero }
         }
     }
+    @Published var retractionDelay: LineRetractionDelay = .fiveSeconds {
+        didSet {
+            if persistsScreenshots { retractionDelay.save() }
+        }
+    }
+    @Published var retractOnOutsideClick = false {
+        didSet {
+            if persistsScreenshots { UserDefaults.standard.set(retractOnOutsideClick, forKey: "retractOnOutsideClick.v1") }
+        }
+    }
+    @Published var retractAfterDrag = true {
+        didSet {
+            if persistsScreenshots { UserDefaults.standard.set(retractAfterDrag, forKey: "retractAfterDrag.v1") }
+        }
+    }
+    @Published var menuBarDoubleClickEnabled = true {
+        didSet {
+            if persistsScreenshots { UserDefaults.standard.set(menuBarDoubleClickEnabled, forKey: "menuBarDoubleClickEnabled.v1") }
+        }
+    }
     /// Context menus, photo picking and fixed-photo positioning keep the line open.
     private(set) var interactionDepth = 0
     func beginInteraction() { interactionDepth += 1 }
@@ -75,6 +98,8 @@ final class Line: ObservableObject {
     var onRequestOpen: ((URL) -> Void)?
     var onRequestSystemOpen: ((URL) -> Void)?
     var onTrashError: ((URL, Error) -> Void)?
+    var onRequestRetract: (() -> Void)?
+    var onRequestAddFolder: (() -> Void)?
     weak var screenshotScrollView: NSScrollView?
 
 
@@ -102,6 +127,14 @@ final class Line: ObservableObject {
     /// Only live cards retain a stamp. Checking metadata is cheap; decoding
     /// again is reserved for images saved by an external editor.
     private var thumbnailStamps: [UUID: ThumbnailStamp] = [:]
+    private var thumbnailGeneration = 0
+    private let thumbnailQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "Clipline changed screenshot previews"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
 
     private struct ThumbnailStamp: Equatable {
         let modified: Date
@@ -119,12 +152,18 @@ final class Line: ObservableObject {
     }
 
     init(persistsScreenshots: Bool = true, restoresSavedCaptures: Bool = true,
+         folders: FolderShelf? = nil,
          trashFile: @escaping (URL) throws -> Void = {
              try FileManager.default.trashItem(at: $0, resultingItemURL: nil)
          }) {
         self.persistsScreenshots = persistsScreenshots
+        self.folders = folders ?? FolderShelf(persists: persistsScreenshots)
         self.trashFile = trashFile
         if persistsScreenshots {
+            retractionDelay = LineRetractionDelay.load()
+            retractOnOutsideClick = UserDefaults.standard.object(forKey: "retractOnOutsideClick.v1") as? Bool ?? false
+            retractAfterDrag = UserDefaults.standard.object(forKey: "retractAfterDrag.v1") as? Bool ?? true
+            menuBarDoubleClickEnabled = UserDefaults.standard.object(forKey: "menuBarDoubleClickEnabled.v1") as? Bool ?? true
             showsControls = UserDefaults.standard.object(forKey: "showLineControls") as? Bool ?? true
             if restoresSavedCaptures { restore() }
             scheduleGust()
@@ -296,17 +335,46 @@ final class Line: ObservableObject {
     /// Pick up saves from the default image editor without repeatedly decoding
     /// unchanged images. A failed or still-changing save keeps the previous
     /// thumbnail and stamp so the next refresh can retry.
-    func refreshChangedThumbnails() {
-        for i in items.indices where !items[i].falling {
-            let item = items[i]
-            guard let stamp = ThumbnailStamp.read(item.url),
-                  stamp != thumbnailStamps[item.id], !item.isVideo,
-                  let thumb = makeThumbnail(item.url, maxPixels: Self.thumbnailPixels),
-                  ThumbnailStamp.read(item.url) == stamp else { continue }
-            items[i].thumb = thumb
-            thumbnailStamps[item.id] = stamp
+    func refreshChangedThumbnails(completion: (() -> Void)? = nil) {
+        thumbnailGeneration += 1
+        let token = thumbnailGeneration
+        let snapshot = items.filter { !$0.falling && !$0.isVideo }
+        let stamps = thumbnailStamps
+        let maxPixels = Self.thumbnailPixels
+        thumbnailQueue.cancelAllOperations()
+        let operation = BlockOperation()
+        operation.addExecutionBlock { [weak self, weak operation] in
+            guard let operation, !operation.isCancelled else { return }
+            var updates: [UUID: (stamp: ThumbnailStamp, image: NSImage)] = [:]
+            for item in snapshot {
+                guard !operation.isCancelled else { return }
+                autoreleasepool {
+                    guard let stamp = ThumbnailStamp.read(item.url), stamp != stamps[item.id],
+                          let image = makeThumbnail(item.url, maxPixels: maxPixels),
+                          ThumbnailStamp.read(item.url) == stamp else { return }
+                    updates[item.id] = (stamp, image)
+                }
+            }
+            let results = updates
+            DispatchQueue.main.async {
+                guard let self, self.thumbnailGeneration == token else { return }
+                var updated = self.items
+                var changed = false
+                for index in updated.indices where !updated[index].falling {
+                    let item = updated[index]
+                    guard let result = results[item.id], ThumbnailStamp.read(item.url) == result.stamp else { continue }
+                    updated[index].thumb = result.image
+                    self.thumbnailStamps[item.id] = result.stamp
+                    changed = true
+                }
+                if changed { self.items = updated }
+                completion?()
+            }
         }
+        thumbnailQueue.addOperation(operation)
     }
+
+    deinit { thumbnailQueue.cancelAllOperations() }
 
     func reveal(_ id: UUID) {
         guard let item = items.first(where: { $0.id == id }) else { return }

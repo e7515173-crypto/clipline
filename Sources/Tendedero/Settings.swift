@@ -51,6 +51,7 @@ final class SettingsController: NSObject, NSWindowDelegate {
             updateTitle()
         }
         guard let window else { return }
+        preferences.startMonitoring()
         if !announcedVisible {
             announcedVisible = true
             onVisibilityChanged(true)
@@ -63,6 +64,7 @@ final class SettingsController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard announcedVisible else { return }
         announcedVisible = false
+        preferences.stopMonitoring()
         onVisibilityChanged(false)
     }
 
@@ -90,6 +92,7 @@ final class SettingsPreferences: ObservableObject {
     private let line: Line
     private let permissionCheck: () -> Bool
     private let listeningCheck: @MainActor () -> Bool
+    private var monitoringTimer: Timer?
 
     init(line: Line, permissionCheck: @escaping () -> Bool = { MenuBarHitTest.isAuthorized },
          listeningCheck: @escaping @MainActor () -> Bool = { MenuBarClickMonitor.isListening },
@@ -106,6 +109,22 @@ final class SettingsPreferences: ObservableObject {
         let listening = granted && listeningCheck()
         if menuBarListening != listening { menuBarListening = listening }
     }
+
+    func startMonitoring() {
+        guard monitoringTimer == nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshCaptureState()
+                self?.refreshAccessibility()
+            }
+        }
+        monitoringTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func stopMonitoring() { monitoringTimer?.invalidate(); monitoringTimer = nil }
+
+    deinit { monitoringTimer?.invalidate() }
 
     func refresh() {
         refreshAccessibility()
@@ -195,10 +214,41 @@ struct SettingsView: View {
                         }
                         .padding(.top, 6)
                     }
+                    Toggle(C("Enable menu-bar double-click", "双击菜单栏空白处展开或收起", "按兩下選單列空白處展開或收起"),
+                           isOn: Binding(get: { line.menuBarDoubleClickEnabled }, set: { enabled in
+                               line.menuBarDoubleClickEnabled = enabled
+                               if enabled && !preferences.accessibilityGranted { SystemImageOpener.requestWindowPermission() }
+                           }))
                     Text(C("Double-click empty menu-bar space to show or hide the line.",
                            "双击菜单栏空白处，展开或收起晾绳。",
                            "按兩下選單列空白處，展開或收起曬衣繩。"))
                         .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Picker(C("Auto-retract delay", "自动回收时间", "自動收起時間"), selection: $line.retractionDelay) {
+                        ForEach(LineRetractionDelay.allCases) { delay in
+                            if delay == .never {
+                                Text(C("Never automatically retract", "永不自动回收", "永不自動收起")).tag(delay)
+                            } else {
+                                Text("\(Int(delay.rawValue)) " + C("seconds", "秒", "秒")).tag(delay)
+                            }
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    // AppKit caches menu item titles across SwiftUI language changes.
+                    .id(language.resolved)
+                    Text(C("After a screenshot arrives or the pointer leaves the line. Hovering or dragging pauses the countdown.",
+                           "截图挂上或鼠标移开后开始计时；悬停或拖拽时暂停回收。",
+                           "截圖掛上或滑鼠移開後開始計時；停留或拖曳時暫停收起。"))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle(C("Retract when clicking outside the line", "点击晾绳外收起", "點擊曬衣繩外收起"),
+                           isOn: $line.retractOnOutsideClick)
+                    Toggle(C("Retract after dragging a capture out", "拖出截图后收起", "拖出截圖後收起"),
+                           isOn: $line.retractAfterDrag)
+                    Text(C("Retract after a successful drop into another app or folder. Cancelled or rejected drops keep the line open.",
+                           "成功拖入其他应用或文件夹后收起；取消拖拽或目标未接收时保持展开。",
+                           "成功拖入其他應用程式或資料夾後收起；取消拖曳或目標未接收時保持展開。"))
+                        .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(C("Double-click tolerance is at least 0.7 seconds; a slower system setting is respected.",
                            "两次点击间隔可达 0.7 秒；系统设得更慢时也会跟随。",
@@ -239,7 +289,7 @@ struct SettingsView: View {
                             }
                         }.padding(.top, 6)
                     }
-                    if preferences.accessibilityGranted && !preferences.menuBarListening {
+                    if line.menuBarDoubleClickEnabled && preferences.accessibilityGranted && !preferences.menuBarListening {
                         Text(C("Mouse monitoring is unavailable; quit and reopen Clipline after authorizing it.",
                                "暂时无法监听鼠标；完成授权后请退出并重新打开 Clipline。",
                                "暫時無法監聽滑鼠；完成授權後請結束並重新開啟 Clipline。"))
@@ -310,10 +360,6 @@ struct SettingsView: View {
         .scrollIndicators(.hidden)
         .frame(width: 540, height: 720)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-            preferences.refreshCaptureState()
-            preferences.refreshAccessibility()
-        }
     }
 
     private var captureStatus: String {

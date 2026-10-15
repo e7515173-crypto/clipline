@@ -18,9 +18,8 @@ enum MenuBarHitTest {
             guard let role = node.role else { return .unavailable }
             if role == (kAXMenuBarRole as String) { return .blank }
             if node.hasActions { return .occupied }
-            guard isContainer(role) else {
-                return isWindowContainer(role) ? .unavailable : .occupied
-            }
+            if isWindowContainer(role) { return .unavailable }
+            if !isContainer(role) { return .occupied }
         }
         return .unavailable
     }
@@ -37,7 +36,7 @@ enum MenuBarHitTest {
               var current = element else { return .unavailable }
         var ancestry: [Node] = []
         let deadline = ProcessInfo.processInfo.systemUptime + 0.4
-        for _ in 0..<6 {
+        for _ in 0..<10 {
             guard ProcessInfo.processInfo.systemUptime < deadline else { return .unavailable }
             AXUIElementSetMessagingTimeout(current, 0.12)
             var roleValue: CFTypeRef?
@@ -50,7 +49,7 @@ enum MenuBarHitTest {
             // A foreground app may temporarily return a window/application
             // during a menu-bar rebuild. Retry, but never accept it as blank.
             if isWindowContainer(role) { return .unavailable }
-            guard isContainer(role) else { return .occupied }
+            if !isContainer(role) { return .occupied }
             var actions: CFArray?
             let result = AXUIElementCopyActionNames(current, &actions)
             guard result == .success || result == .actionUnsupported else { return .unavailable }
@@ -72,6 +71,9 @@ enum MenuBarHitTest {
     }
 
     private static func isContainer(_ role: String) -> Bool {
-        role == (kAXGroupRole as String) || role == (kAXUnknownRole as String)
+        switch role {
+        case "AXGroup", "AXUnknown", "AXLayoutArea", "AXToolbar", "AXSplitGroup": return true
+        default: return false
+        }
     }
 }

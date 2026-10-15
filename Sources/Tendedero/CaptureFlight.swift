@@ -47,6 +47,7 @@ final class CaptureFlight {
     private var duration: CFTimeInterval = CaptureFlight.duration
     private var start: CFTimeInterval = 0
     private var timer: Timer?
+    private let frameInterval: TimeInterval
     private var completion: () -> Void = {}
 
     private static var current: [CaptureFlight] = []
@@ -82,6 +83,7 @@ final class CaptureFlight {
         self.from = from
         self.to = to
         self.tilt = tilt
+        frameInterval = 1.0 / Double(max(60, screen.maximumFramesPerSecond))
         window = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
         window.isOpaque = false
@@ -135,7 +137,7 @@ final class CaptureFlight {
         if falling { update(1); updateFall(0) } else { update(0) }
         window.orderFrontRegardless()
         start = CACurrentMediaTime()
-        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: frameInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
         RunLoop.main.add(timer, forMode: .common)

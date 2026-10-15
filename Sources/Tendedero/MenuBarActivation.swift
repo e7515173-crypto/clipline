@@ -12,6 +12,9 @@ final class MenuBarActivation {
     private var validation: Task<Void, Never>?
     private var generation = 0
     private var pointerAnchor: (point: CGPoint, screen: CGRect)?
+    var isEnabled = true {
+        didSet { if !isEnabled { reset() } }
+    }
     var onActivate: ((MenuBarDoubleClickTrigger.Pair) -> Void)?
 
     init(hitTest: @escaping HitTest = { point, top in
@@ -43,6 +46,7 @@ final class MenuBarActivation {
 
     func click(point: CGPoint, screen: CGRect, time: TimeInterval, interval: TimeInterval,
                context: Int32, wasRevealed: Bool, primaryTop: CGFloat) {
+        guard isEnabled else { return }
         pointerAnchor = (point, screen)
         guard let pair = trigger.click(point: point, screen: screen, time: time,
                                        interval: interval, context: context, wasRevealed: wasRevealed) else { return }
@@ -58,7 +62,7 @@ final class MenuBarActivation {
                 if first == .occupied { return }
                 let second = pair.firstPoint == pair.secondPoint ? first
                     : await hitTest(pair.secondPoint, primaryTop)
-                guard !Task.isCancelled, let self, self.generation == token else { return }
+                guard !Task.isCancelled, let self, self.isEnabled, self.generation == token else { return }
                 if second == .occupied { return }
                 if first == .blank && second == .blank {
                     self.onActivate?(pair)

@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                              ? NSPasteboard.withUniqueName() : .general)
     private let pinnedPhotos = PinnedPhotos(persists: !ProcessInfo.processInfo.arguments.contains("--demo"))
     private var choosingPhoto = false
+    private var choosingFolder = false
     private var editingImage = false
     private lazy var imageOpener: SystemImageOpener = {
         let opener = SystemImageOpener()
@@ -40,7 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var toolScreen: NSScreen?
     private var toolWasRevealed = false
     private var toolPreviousApp: NSRunningApplication?
-    private var suspendsLine: Bool { choosingPhoto || editingImage || !openTools.isEmpty }
+    private var suspendsLine: Bool { choosingPhoto || choosingFolder || editingImage || !openTools.isEmpty }
     private lazy var settings = SettingsController(
         line: line, clipboard: clipboard,
         onSetInbox: { [weak self] in self?.setInbox($0) },
@@ -60,7 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKey: HotKey?
     private var clipboardHotKey: HotKey?
     private var cancellables = Set<AnyCancellable>()
+    private var notificationObservations: [(NotificationCenter, NSObjectProtocol)] = []
     private var mouseTimer: Timer?
+    private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
 
     /// Whether the panel is ordered in. It can be in and still tucked away
     /// above the top edge, like an auto-hiding Dock.
@@ -70,8 +74,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Opened on purpose with the shortcut or the menu: it stays down until
     /// the cursor has visited it and left, or the shortcut is pressed again.
     private var pinned = false
-    /// A new screenshot shows itself for a moment, then tucks away.
-    private var peekUntil = Date.distantPast
     private let menuBarActivation = MenuBarActivation()
     private var statusMenuIsOpen = false
     private let menuBarClickMonitor = MenuBarClickMonitor()
@@ -105,7 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         clipboard.onChange = { [weak self] in
             guard let self else { return }
-            if self.line.liveCount == 0 && self.pinnedPhotos.photos.isEmpty && !self.clipboard.entries.isEmpty && !self.isRevealed {
+            if self.line.section == .screenshots && self.line.liveCount == 0 && self.pinnedPhotos.photos.isEmpty && !self.clipboard.entries.isEmpty && !self.isRevealed {
                 self.line.section = .clipboard
             }
             self.refresh()
@@ -119,11 +121,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.clipboard.hitRects.removeAll()
             self?.pinnedPhotos.hitRects.removeAll()
         }.store(in: &cancellables)
+        line.$menuBarDoubleClickEnabled.sink { [weak self] enabled in
+            self?.menuBarActivation.isEnabled = enabled
+            self?.resetMenuBarTrigger()
+            if enabled { self?.menuBarClickMonitor.start() }
+            else { self?.menuBarClickMonitor.stop() }
+        }.store(in: &cancellables)
         line.canPinPhoto = { [weak self] width in
             guard let self, !self.isDemo else { return false }
             return self.pinnedPhotos.photos.count < PinnedPhotos.capacity(width: width)
         }
         line.onRequestPin = { [weak self] x, width in self?.choosePinnedImage(atX: x, width: width) }
+        line.onRequestAddFolder = { [weak self] in self?.chooseFolders() }
+        line.folders.canRefresh = { [weak self] in
+            guard let self else { return false }
+            return !GrabView.isDragging && self.line.pressedID == nil && self.line.interactionDepth == 0
+        }
         line.onRequestReplacePin = { [weak self] id in self?.choosePinnedImage(replacing: id) }
         line.onRequestOpen = { [weak self] url in
             guard let self else { return }
@@ -131,6 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         line.onRequestSystemOpen = { [weak self] url in
             self?.imageOpener.openInSystemEditor(url)
+        }
+        line.onRequestRetract = { [weak self] in
+            guard let self, !self.suspendsLine else { return }
+            self.awaySince = nil
+            self.setRevealed(false)
         }
         line.onTrashError = { [weak self] url, error in
             guard let self else { return }
@@ -146,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         setUpStatusItem()
         watchMenuBarClicks()
+        watchOutsideClicks()
 
         line.onFall = { [weak self] item in self?.fall(item) }
 
@@ -157,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Reassert the auxiliary panel after an app or Space transition.
         let workspace = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification] {
-            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            let observer = workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.refresh()
                     if self?.isDemo == false {
@@ -167,15 +186,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self?.refresh() }
                 }
             }
+            notificationObservations.append((workspace, observer))
         }
 
-        NotificationCenter.default.addObserver(
+        let screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.panel.placeOnScreen()
             }
         }
+
+        notificationObservations.append((.default, screenObserver))
 
         if !isDemo && !Inbox.wasOffered {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.offerInbox() }
@@ -187,7 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refresh()
             reveal(pinned: true)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                guard let self, self.line.liveCount == 0, self.clipboard.entries.isEmpty, self.pinnedPhotos.photos.isEmpty else { return }
+                guard let self, self.line.liveCount == 0, self.clipboard.entries.isEmpty, self.pinnedPhotos.photos.isEmpty, self.line.folders.mounts.isEmpty else { return }
                 self.keepOpen = false
                 self.setRevealed(false)
             }
@@ -221,14 +243,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        for (center, observer) in notificationObservations { center.removeObserver(observer) }
+        notificationObservations.removeAll()
         imageOpener.stop()
         clipboard.stop()
+        line.folders.stop()
         stopMouseTracking()
         captureSettingsTimer?.invalidate()
         watcher?.stop()
         recordingWatcher?.stop()
         captureFolderGeneration &+= 1
         menuBarClickMonitor.stop()
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+        globalClickMonitor = nil
+        localClickMonitor = nil
         menuBarActivation.reset()
         if !isDemo && Inbox.isEnabled { Inbox.restore() }
     }
@@ -383,6 +412,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Showing and hiding
 
+    private func chooseFolders() {
+        guard !isDemo, !suspendsLine else { return }
+        choosingFolder = true
+        line.beginInteraction()
+        resetMenuBarTrigger()
+        let originalScreen = panel.screen
+        let wasRevealed = isRevealed
+        let previousApp = NSWorkspace.shared.frontmostApplication
+        panel.orderOut(nil)
+        var addedFolder = false
+        defer {
+            choosingFolder = false
+            line.endInteraction()
+            let screen = NSScreen.screens.first { $0.frame == originalScreen?.frame } ?? LinePanel.screenUnderPointer()
+            panel.placeOnScreen(screen)
+            refresh()
+            if wasRevealed || addedFolder { reveal(pinned: true) }
+            panel.orderFrontRegardless()
+            if previousApp?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                previousApp?.activate(options: [])
+            }
+        }
+        let picker = NSOpenPanel()
+        picker.title = C("Choose folders to hang", "选择要挂上的文件夹", "選擇要掛上的資料夾")
+        picker.prompt = C("Add folder", "添加文件夹", "新增資料夾")
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.allowsMultipleSelection = true
+        NSApp.activate(ignoringOtherApps: true)
+        guard picker.runModal() == .OK else { return }
+        for url in picker.urls {
+            do {
+                let id = try line.folders.add(url)
+                keepOpen = true
+                line.showsControls = true
+                line.section = .folder(id)
+                addedFolder = true
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = C("Could not read this folder", "无法读取此文件夹", "無法讀取此資料夾")
+                alert.informativeText = url.lastPathComponent + "\n" + error.localizedDescription
+                alert.runModal()
+            }
+        }
+    }
+
     /// The settings window receives focus without the status-level clothesline
     /// covering it. Reopening the same window must restore it only once.
     private func toolVisibilityChanged(_ tool: ToolWindow, visible: Bool) {
@@ -464,10 +539,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panel.placeOnScreen(pendingScreen)
             pendingScreen = nil
             refresh()
-            reveal(peekFor: 2.5)
-        } else if live == 0 && clipboard.entries.isEmpty && pinnedPhotos.photos.isEmpty && !keepOpen {
+            reveal()
+        } else if live == 0 && clipboard.entries.isEmpty && pinnedPhotos.photos.isEmpty && line.folders.mounts.isEmpty && !keepOpen {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-                guard let self, self.line.liveCount == 0, self.clipboard.entries.isEmpty, self.pinnedPhotos.photos.isEmpty, !self.keepOpen else { return }
+                guard let self, self.line.liveCount == 0, self.clipboard.entries.isEmpty, self.pinnedPhotos.photos.isEmpty, self.line.folders.mounts.isEmpty, !self.keepOpen else { return }
                 self.setRevealed(false)
             }
         }
@@ -504,7 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !panel.slideView.isAnimating, let rect = line.cardLayoutRects[id],
               rect.minX >= line.interactionRect.minX,
               rect.maxX <= line.interactionRect.maxX,
-              let to = cardFrame(for: id) else {
+              cardFrame(for: id) != nil else {
             if ProcessInfo.processInfo.systemUptime < deadline {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60) { [weak self] in
                     self?.fly(id, from: from, deadline: deadline)
@@ -513,13 +588,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let pixels = Int(max(from.width, from.height) * screen.backingScaleFactor)
-        guard let image = makeThumbnail(item.url, maxPixels: min(3000, max(400, pixels)))?
-            .cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            line.land(id)
-            return
-        }
-        CaptureFlight.fly(image: image, from: from, to: to, tilt: CGFloat(item.tilt), on: screen) { [weak self] in
-            self?.line.land(id)
+        let screenFrame = screen.frame
+        captureLoadingQueue.async { [weak self] in
+            let image = autoreleasepool {
+                makeThumbnail(item.url, maxPixels: min(3000, max(400, pixels)))?
+                    .cgImage(forProposedRect: nil, context: nil, hints: nil)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let image, !self.suspendsLine, self.isRevealed,
+                      self.line.section == .screenshots,
+                      let currentScreen = self.panel.screen, currentScreen.frame == screenFrame,
+                      self.line.items.last(where: { !$0.falling })?.id == id,
+                      let target = self.cardFrame(for: id) else { self.line.land(id); return }
+                CaptureFlight.fly(image: image, from: from, to: target, tilt: CGFloat(item.tilt), on: currentScreen) { [weak self] in
+                    self?.line.land(id)
+                }
+            }
         }
     }
 
@@ -543,8 +628,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refresh() {
         guard !suspendsLine else { return }
         present()
-        if isRevealed { panel.orderFrontRegardless() }
-        startMouseTracking()
+        if isRevealed {
+            panel.orderFrontRegardless()
+            startMouseTracking()
+        }
     }
 
     private func present() {
@@ -554,10 +641,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.orderFrontRegardless()
     }
 
-    private func reveal(pinned: Bool = false, peekFor seconds: TimeInterval = 0) {
+    private func reveal(pinned: Bool = false) {
         guard !suspendsLine, isPresent else { return }
         if pinned { self.pinned = true }
-        if seconds > 0 { peekUntil = Date().addingTimeInterval(seconds) }
         awaySince = nil
         setRevealed(true)
     }
@@ -569,9 +655,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         line.revealed = on
         if !on {
             pinned = false
-            peekUntil = .distantPast
-            panel.ignoresMouseEvents = true
+            stopMouseTracking()
         } else {
+            startMouseTracking()
             updateMousePassThrough(NSEvent.mouseLocation)
         }
     }
@@ -581,7 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !suspendsLine else { return }
         if isRevealed {
             setRevealed(false)
-            if line.liveCount == 0 && clipboard.entries.isEmpty && pinnedPhotos.photos.isEmpty {
+            if line.liveCount == 0 && clipboard.entries.isEmpty && pinnedPhotos.photos.isEmpty && line.folders.mounts.isEmpty {
                 keepOpen = false
                 refresh()
             }
@@ -633,6 +719,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.ignoresMouseEvents = true
     }
 
+    /// Observe clicks without consuming them, so the target app still receives
+    /// the same click. Mouse monitoring also works without Accessibility access.
+    private func watchOutsideClicks() {
+        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: clicks) { [weak self] event in
+            MainActor.assumeIsolated { self?.dismissOnOutsideClick(event) }
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: clicks) { [weak self] event in
+            MainActor.assumeIsolated { self?.dismissOnOutsideClick(event) }
+            return event
+        }
+    }
+
+    private func dismissOnOutsideClick(_ event: NSEvent) {
+        guard line.retractOnOutsideClick, isRevealed, !suspendsLine, !statusMenuIsOpen,
+              !GrabView.isDragging, pinnedPhotos.draggingID == nil,
+              line.pressedID == nil, line.interactionDepth == 0 else { return }
+        // Local events delivered to the panel belong to its controls or cards.
+        guard event.window !== panel else { return }
+        let point: NSPoint
+        if let location = event.cgEvent?.location {
+            let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+            point = NSPoint(x: location.x, y: primaryTop - location.y)
+        } else if let window = event.window {
+            point = window.convertPoint(toScreen: event.locationInWindow)
+        } else {
+            point = NSEvent.mouseLocation
+        }
+        guard !isOverLine(point) else { return }
+        awaySince = nil
+        setRevealed(false)
+    }
+
     /// The menu bar strip at the top of a screen. With an auto-hiding menu
     /// bar the visible frame reaches the top, so the system thickness is used.
     static func menuBarBand(of screen: NSScreen) -> NSRect {
@@ -645,7 +764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func watchMenuBarClicks() {
         menuBarActivation.onActivate = { [weak self] pair in
-            guard let self, !self.suspendsLine, !self.statusMenuIsOpen,
+            guard let self, self.line.menuBarDoubleClickEnabled, !self.suspendsLine, !self.statusMenuIsOpen,
                   MenuBarHitTest.isAuthorized,
                   NSWorkspace.shared.frontmostApplication?.processIdentifier == pair.context,
                   let screen = NSScreen.screens.first(where: { $0.frame == pair.screen }) else { return }
@@ -659,11 +778,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menuBarClickMonitor.onClick = { [weak self] click in self?.handleMenuBarClick(click) }
-        menuBarClickMonitor.start()
+        if line.menuBarDoubleClickEnabled { menuBarClickMonitor.start() }
     }
 
     private func handleMenuBarClick(_ event: MenuBarClickMonitor.Click) {
-        guard !suspendsLine, !statusMenuIsOpen else { resetMenuBarTrigger(); return }
+        guard line.menuBarDoubleClickEnabled, !suspendsLine, !statusMenuIsOpen else { resetMenuBarTrigger(); return }
         // Use the event's position, not a later sample of a moving pointer.
         let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
         let point = CGPoint(x: event.point.x, y: primaryTop - event.point.y)
@@ -681,9 +800,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 context: NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
                                 wasRevealed: isRevealed, primaryTop: primaryTop)
     }
-    /// How long the cursor is away before the line tucks back up.
-    private static let retractDelay: TimeInterval = 0.5
-
     private func tick() {
         guard !suspendsLine else { return }
         let mouse = NSEvent.mouseLocation
@@ -701,13 +817,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let inside = TopEdgeTrigger.contains(mouse, in: zone)
         if inside && pinned { pinned = false }
 
-        let busy = pinned || GrabView.isDragging || line.pressedID != nil || line.interactionDepth > 0 || statusMenuIsOpen || now < peekUntil
+        let busy = pinned || GrabView.isDragging || line.pressedID != nil || line.interactionDepth > 0 || statusMenuIsOpen
         if inside || busy {
             awaySince = nil
         } else {
             let since = awaySince ?? now
             awaySince = since
-            if now.timeIntervalSince(since) >= Self.retractDelay {
+            if line.retractionDelay.shouldRetract(after: now.timeIntervalSince(since)) {
                 awaySince = nil
                 setRevealed(false)
             }
@@ -722,14 +838,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard !GrabView.isDragging, pinnedPhotos.draggingID == nil else { return }
-        let local = panel.convertPoint(fromScreen: mouse)
-        let flipped = CGPoint(x: local.x, y: panel.frame.height - local.y)
-        let viewport = line.section == .screenshots ? line.interactionRect : clipboard.interactionRect
-        let overPin = line.section == .screenshots && pinnedPhotos.hitRects.values.contains { $0.insetBy(dx: -4, dy: -4).contains(flipped) }
-        let interactive = overPin || viewport.contains(flipped) || (line.showsControls && line.controlsRect.contains(flipped))
+        let interactive = isOverLine(mouse)
         if panel.ignoresMouseEvents == interactive {
             panel.ignoresMouseEvents = !interactive
         }
+    }
+
+    private func isOverLine(_ mouse: NSPoint) -> Bool {
+        let local = panel.convertPoint(fromScreen: mouse)
+        let flipped = CGPoint(x: local.x, y: panel.frame.height - local.y)
+        let viewport: CGRect
+        switch line.section {
+        case .screenshots: viewport = line.interactionRect
+        case .clipboard: viewport = clipboard.interactionRect
+        case .folder: viewport = line.folders.interactionRect
+        }
+        let overPin = line.section == .screenshots && pinnedPhotos.hitRects.values.contains { $0.insetBy(dx: -4, dy: -4).contains(flipped) }
+        return overPin || viewport.contains(flipped) || (line.showsControls && line.controlsRect.contains(flipped))
     }
 
     // MARK: Menu bar
@@ -772,6 +897,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let screenshots = ClosureMenuItem(C("Captures", "截图与录屏", "截圖與錄影")) { [weak self] in self?.showScreenshots() }
             screenshots.isEnabled = !suspendsLine
             menu.addItem(screenshots)
+            let addFolder = ClosureMenuItem(C("Add folder", "添加文件夹", "新增資料夾")) { [weak self] in self?.chooseFolders() }
+            addFolder.isEnabled = !suspendsLine
+            menu.addItem(addFolder)
+            for mount in line.folders.mounts {
+                let folder = ClosureMenuItem(mount.name) { [weak self] in
+                    guard let self, !self.suspendsLine else { return }
+                    self.line.section = .folder(mount.id)
+                    self.keepOpen = true
+                    self.refresh()
+                    self.reveal(pinned: true)
+                }
+                folder.isEnabled = !suspendsLine
+                menu.addItem(folder)
+            }
         }
 
         let historyItem = ClosureMenuItem(C("Clipboard history", "剪贴板历史")) { [weak self] in

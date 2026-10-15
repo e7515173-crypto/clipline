@@ -13,6 +13,10 @@ struct EditorWindowChecks {
             checks += 1
         }
         let fm = FileManager.default
+        check(ImageCropFrame.pixelAligned(CGRect(x: 15 - 1e-12, y: 10 + 1e-12, width: 50 + 2e-12, height: 20 - 2e-12)) == CGRect(x: 15, y: 10, width: 50, height: 20),
+              "floating-point noise cannot add a crop pixel")
+        check(ImageCropFrame.pixelAligned(CGRect(x: 15.25, y: 10.25, width: 50, height: 20)) == CGRect(x: 15, y: 10, width: 51, height: 21),
+              "real fractional selections retain their covered pixels")
         let root = fm.temporaryDirectory.appendingPathComponent("clipline-editor-" + UUID().uuidString)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }

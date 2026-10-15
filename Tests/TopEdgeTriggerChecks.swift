@@ -46,6 +46,8 @@ import AppKit
         check(MenuBarHitTest.isBlank([bar]), "background role accepted")
         check(MenuBarHitTest.isBlank([node("AXGroup"), bar]), "inert group on menu bar accepted")
         check(MenuBarHitTest.isBlank([node("AXUnknown"), node("AXGroup"), bar]), "nested blank containers accepted")
+        check(MenuBarHitTest.isBlank([node("AXLayoutArea"), node("AXToolbar"), bar]), "modern inert menu-bar containers accepted")
+        check(!MenuBarHitTest.isBlank([node("AXToolbar", true), bar]), "interactive toolbar still excluded")
         for role in [nil, "AXMenuBarItem", "AXButton", "AXWindow", "AXWebArea", "AXMenuItem", "AXImage", "AXStaticText"] as [String?] {
             check(!MenuBarHitTest.isBlank([node(role), bar]), "interactive or unrelated descendants excluded")
         }

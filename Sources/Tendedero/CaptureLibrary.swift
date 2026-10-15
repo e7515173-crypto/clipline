@@ -34,11 +34,13 @@ enum CaptureLibrary {
             let paths = Set(savedPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
             urls = urls.filter { paths.contains($0.standardizedFileURL.path) }
         }
-        func date(_ url: URL) -> Date {
-            (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+        // Read each creation date once, rather than during every sort comparison.
+        let dated = urls.map { url in
+            (url: url, date: (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast)
         }
-        return urls.sorted { date($0) == date($1) ? $0.path < $1.path : date($0) < date($1) }
-            .suffix(limit).compactMap { url in
+        return dated.sorted { $0.date == $1.date ? $0.url.path < $1.url.path : $0.date < $1.date }
+            .suffix(limit).compactMap { entry in
+                let url = entry.url
                 guard let thumbnail = CaptureMedia.thumbnail(url) else { return nil }
                 return Card(url: url.standardizedFileURL.absoluteURL, thumbnail: thumbnail)
             }
