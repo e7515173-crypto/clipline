@@ -285,6 +285,22 @@ struct EditorWindowChecks {
                                       timestamp: 1, windowNumber: gesturePanel.windowNumber, context: nil,
                                       eventNumber: 1, clickCount: 1, pressure: 1)!
         }
+        // AppKit refreshes cursors before the first drag has given a free-crop
+        // selection any area. Exercise this intermediate state, not only mouse-up.
+        gestureDoc.tool = .crop
+        gestureCanvas.mouseDown(with: mouse(.leftMouseDown, at: CGPoint(x: 10, y: 20)))
+        check(gestureDoc.cropSelection?.size == .zero, "free crop begins with an empty selection")
+        gestureCanvas.resetCursorRects()
+        check(gestureDoc.cropSelection?.size == .zero, "refreshing cursors during mouse-down leaves an empty crop intact")
+        for size in [CGSize(width: 0.1, height: 0.1), CGSize(width: 0.1, height: 10), CGSize(width: 10, height: 0.1)] {
+            gestureDoc.cropSelection = CGRect(origin: CGPoint(x: 10, y: 20), size: size)
+            gestureCanvas.discardCursorRects()
+            gestureCanvas.resetCursorRects()
+            check(gestureDoc.cropSelection?.size == size, "thin free-crop selections can refresh native cursors safely")
+        }
+        gestureCanvas.cancelGesture()
+        gestureDoc.cancelCrop()
+        gestureDoc.tool = .brush
         gestureDoc.color = .red
         gestureDoc.width = 4
         gestureCanvas.mouseDown(with: mouse(.leftMouseDown, at: CGPoint(x: 10, y: 20)))

@@ -672,15 +672,23 @@ final class ImageEditCanvas: NSView {
     }
     override func resetCursorRects() {
         guard document.tool == .crop else { return }
-        addCursorRect(imageFrame, cursor: .crosshair)
+        func addValidCursorRect(_ rect: CGRect, cursor: NSCursor) {
+            // A new or thin crop has no inset interior. CGRect.insetBy can
+            // return .null, whose infinite origin makes AppKit raise an exception.
+            guard !rect.isEmpty, !rect.isNull, !rect.isInfinite,
+                  rect.minX.isFinite, rect.minY.isFinite,
+                  rect.maxX.isFinite, rect.maxY.isFinite else { return }
+            addCursorRect(rect, cursor: cursor)
+        }
+        addValidCursorRect(imageFrame, cursor: .crosshair)
         if let selection = document.visibleCropSelection {
             let rect = CGRect(x: imageFrame.minX + selection.minX * scale, y: imageFrame.minY + selection.minY * scale,
                               width: selection.width * scale, height: selection.height * scale)
-            addCursorRect(rect.insetBy(dx: 9, dy: 9), cursor: .openHand)
+            addValidCursorRect(rect.insetBy(dx: 9, dy: 9), cursor: .openHand)
             if document.cropPreset?.isFixedSize != true {
                 for handle in ImageCropHandle.allCases {
                     let point = handle.point(in: rect)
-                    addCursorRect(CGRect(x: point.x - 9, y: point.y - 9, width: 18, height: 18), cursor: .crosshair)
+                    addValidCursorRect(CGRect(x: point.x - 9, y: point.y - 9, width: 18, height: 18), cursor: .crosshair)
                 }
             }
         }
